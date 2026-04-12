@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import copy
-import csv
 import random
 from pathlib import Path
 
@@ -13,7 +12,7 @@ import torch.utils.data
 
 from prml_denoise.config import ResUNetConfig
 from prml_denoise.data_io import download_datasets, load_audio
-from prml_denoise.dsp import compute_pesq, compute_snr, frame_signal_row_major, mix_at_snr, overlap_add_row_major
+from prml_denoise.dsp import frame_signal_row_major, mix_at_snr, overlap_add_row_major
 from prml_denoise.models.resunet import DenoiseLoss, ResUNet
 
 
@@ -159,28 +158,17 @@ def run(config: ResUNetConfig) -> None:
         model.load_state_dict(best_state)
         torch.save(best_state, config.output_dir / "best_resunet.pt")
 
-    metrics_path = config.output_dir / "metrics.csv"
-    with metrics_path.open("w", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow(["case", "snr_noisy", "snr_denoised", "pesq_noisy", "pesq_denoised"])
-        model.eval()
-        with torch.no_grad():
-            for p in pairs:
-                n_frames = frame_signal_row_major(p["noisy"], config.frame_size, config.hop_size)
-                x = torch.tensor(n_frames, dtype=torch.float32).unsqueeze(1).to(device)
-                pred_frames = model(x).squeeze(1).cpu().numpy()
-                den = overlap_add_row_major(pred_frames, config.hop_size, len(p["clean"]))
+    model.eval()
+    with torch.no_grad():
+        for p in pairs:
+            n_frames = frame_signal_row_major(p["noisy"], config.frame_size, config.hop_size)
+            x = torch.tensor(n_frames, dtype=torch.float32).unsqueeze(1).to(device)
+            pred_frames = model(x).squeeze(1).cpu().numpy()
+            den = overlap_add_row_major(pred_frames, config.hop_size, len(p["clean"]))
 
-                snr_n = compute_snr(p["clean"][: len(den)], p["noisy"][: len(den)])
-                snr_d = compute_snr(p["clean"][: len(den)], den)
-                pesq_n = compute_pesq(p["clean"][: len(den)], p["noisy"][: len(den)], config.target_sr)
-                pesq_d = compute_pesq(p["clean"][: len(den)], den, config.target_sr)
-
-                writer.writerow([p["name"], f"{snr_n:.6f}", f"{snr_d:.6f}", f"{pesq_n:.6f}", f"{pesq_d:.6f}"])
-
-                sf.write(config.output_dir / f"{p['name']}_clean.wav", p["clean"], config.target_sr)
-                sf.write(config.output_dir / f"{p['name']}_noisy.wav", p["noisy"], config.target_sr)
-                sf.write(config.output_dir / f"{p['name']}_denoised.wav", den, config.target_sr)
+            sf.write(config.output_dir / f"{p['name']}_clean.wav", p["clean"], config.target_sr)
+            sf.write(config.output_dir / f"{p['name']}_noisy.wav", p["noisy"], config.target_sr)
+            sf.write(config.output_dir / f"{p['name']}_denoised.wav", den, config.target_sr)
 
 
 if __name__ == "__main__":
