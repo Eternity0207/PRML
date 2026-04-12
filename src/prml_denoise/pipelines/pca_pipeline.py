@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import random
 from pathlib import Path
 
@@ -14,7 +13,7 @@ import soundfile as sf
 
 from prml_denoise.config import PcaConfig
 from prml_denoise.data_io import AUDIO_EXTENSIONS, download_datasets, list_audio_files, load_audio
-from prml_denoise.dsp import compute_pesq, compute_snr, frame_signal, mix_at_snr, overlap_add_column_major
+from prml_denoise.dsp import frame_signal, mix_at_snr, overlap_add_column_major
 from prml_denoise.models.pca_model import PcaSpeechDenoiser
 
 matplotlib.use("Agg")
@@ -44,7 +43,7 @@ def parse_args() -> PcaConfig:
 
 
 def _plot_representative_spectrogram(clean: np.ndarray, noisy: np.ndarray, denoised: np.ndarray, sr: int, save_path: Path) -> None:
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4), sharey=True)
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4), sharey=True, constrained_layout=True)
     titles = ["Clean", "Noisy", "Denoised"]
     sigs = [clean, noisy, denoised]
     img = None
@@ -54,7 +53,6 @@ def _plot_representative_spectrogram(clean: np.ndarray, noisy: np.ndarray, denoi
         img = librosa.display.specshow(s, sr=sr, hop_length=128, x_axis="time", y_axis="hz", ax=ax)
         ax.set_title(title)
     fig.colorbar(img, ax=axes.tolist(), format="%+2.0f dB", shrink=0.8)
-    plt.tight_layout()
     plt.savefig(save_path, dpi=160)
     plt.close()
 
@@ -95,38 +93,23 @@ def run(config: PcaConfig) -> None:
     denoiser = PcaSpeechDenoiser(config.variance_thresh)
     denoiser.fit(x_train)
 
-    metrics_rows = []
-    representative = None
-    for c in cases:
-        x_hat = denoiser.denoise(c["x"])
-        den = overlap_add_column_major(x_hat, config.hop_size, c["len"])
+    weights_path = Path(__file__).resolve().parents[3] / "pca_weights.npz"
+    np.savez(
+        weights_path,
+        V_s=denoiser.v_s.detach().cpu().numpy().astype(np.float32),
+        mean=denoiser.mean_.detach().cpu().numpy().astype(np.float32),
+    )
 
-        n = min(len(c["clean"]), len(c["noisy"]), len(den))
-        clean = c["clean"][:n]
-        noisy = c["noisy"][:n]
-        den = den[:n]
+    c = cases[0]
+    x_hat = denoiser.denoise(c["x"])
+    den = overlap_add_column_major(x_hat, config.hop_size, c["len"])
 
-        snr_noisy = compute_snr(clean, noisy)
-        snr_den = compute_snr(clean, den)
-        pesq_noisy = compute_pesq(clean, noisy, config.target_sr)
-        pesq_den = compute_pesq(clean, den, config.target_sr)
-
-        metrics_rows.append(
-            {
-                "case": c["id"],
-                "speech_file": c["sp"],
-                "noise_file": c["np"],
-                "snr_noisy": snr_noisy,
-                "snr_denoised": snr_den,
-                "delta_snr": snr_den - snr_noisy,
-                "pesq_noisy": pesq_noisy,
-                "pesq_denoised": pesq_den,
-                "delta_pesq": pesq_den - pesq_noisy,
-            }
-        )
-
-        if representative is None:
-            representative = {"clean": clean, "noisy": noisy, "den": den}
+    n = min(len(c["clean"]), len(c["noisy"]), len(den))
+    representative = {
+        "clean": c["clean"][:n],
+        "noisy": c["noisy"][:n],
+        "den": den[:n],
+    }
 
     if representative is None:
         raise RuntimeError("Representative sample unavailable")
@@ -142,21 +125,7 @@ def run(config: PcaConfig) -> None:
         representative["clean"], representative["noisy"], representative["den"], config.target_sr, config.output_dir / "representative_spectrogram.png"
     )
 
-    with (config.output_dir / "metrics_summary.csv").open("w", newline="") as f:
-        fields = [
-            "case",
-            "speech_file",
-            "noise_file",
-            "snr_noisy",
-            "snr_denoised",
-            "delta_snr",
-            "pesq_noisy",
-            "pesq_denoised",
-            "delta_pesq",
-        ]
-        writer = csv.DictWriter(f, fieldnames=fields)
-        writer.writeheader()
-        writer.writerows(metrics_rows)
+    print(f"Saved PCA weights: {weights_path}")
 
 
 if __name__ == "__main__":

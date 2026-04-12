@@ -87,14 +87,17 @@ class DenoiseLoss(nn.Module):
         self.n_fft = n_fft
         self.hop_length = hop_length
         self.l1 = nn.L1Loss()
+        self.register_buffer("_stft_window", torch.hann_window(self.n_fft), persistent=False)
 
     def _stft_mag(self, x: torch.Tensor) -> torch.Tensor:
         x = x.squeeze(1)
+        window = self._stft_window.to(device=x.device, dtype=x.dtype)
         s = torch.stft(
             x,
             n_fft=self.n_fft,
             hop_length=self.hop_length,
             win_length=self.n_fft,
+            window=window,
             return_complex=True,
         )
         return torch.abs(s)

@@ -14,9 +14,19 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import soundfile as sf
+import torch
 
 from prml_denoise.data_io import AUDIO_EXTENSIONS, list_audio_files, load_audio
-from prml_denoise.dsp import compute_pesq, compute_snr, frame_signal, mix_at_snr, overlap_add_column_major
+from prml_denoise.dsp import (
+    compute_pesq,
+    compute_snr,
+    frame_signal,
+    frame_signal_row_major,
+    mix_at_snr,
+    overlap_add_column_major,
+    overlap_add_row_major,
+)
+from prml_denoise.models.resunet import ResUNet
 
 
 def parse_args() -> argparse.Namespace:
@@ -33,6 +43,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mix-snr-db", type=float, default=0.0)
     parser.add_argument("--num-samples", type=int, default=0, help="0 means use all available pairs")
     parser.add_argument("--random-seed", type=int, default=42)
+    parser.add_argument("--compare-resunet", action="store_true", help="Compare PCA denoising against ResUNet denoising")
+    parser.add_argument("--resunet-weights-path", type=Path, default=Path("outputs/resunet/best_resunet.pt"))
+    parser.add_argument("--resunet-frame-size", type=int, default=512)
+    parser.add_argument("--resunet-hop-size", type=int, default=256)
     parser.add_argument("--skip-video", action="store_true", help="Skip MP4 generation")
     return parser.parse_args()
 
@@ -98,6 +112,44 @@ def pca_denoise_signal(x: np.ndarray, v_s: np.ndarray, mean: np.ndarray, hop_siz
     x_hat = v_s @ (v_s.T @ x_centered) + mean
 
     denoised = overlap_add_column_major(x_hat, hop_size=hop_size, signal_length=len(x))
+    denoised = denoised[:original_len]
+
+    peak = float(np.max(np.abs(denoised)))
+    if peak > 1e-9:
+        denoised = denoised / peak
+
+    return denoised.astype(np.float32)
+
+
+def load_resunet_model(weights_path: Path) -> tuple[ResUNet, torch.device]:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = ResUNet().to(device)
+    state_dict = torch.load(weights_path, map_location=device)
+    model.load_state_dict(state_dict)
+    model.eval()
+    return model, device
+
+
+def resunet_denoise_signal(
+    x: np.ndarray,
+    model: ResUNet,
+    device: torch.device,
+    frame_size: int,
+    hop_size: int,
+) -> np.ndarray:
+    original_len = len(x)
+    if original_len < frame_size:
+        x = np.pad(x, (0, frame_size - original_len), mode="constant")
+
+    frames = frame_signal_row_major(x, frame_size=frame_size, hop_size=hop_size)
+    if len(frames) == 0:
+        return np.zeros(original_len, dtype=np.float32)
+
+    with torch.no_grad():
+        x_tensor = torch.tensor(frames, dtype=torch.float32).unsqueeze(1).to(device)
+        pred_frames = model(x_tensor).squeeze(1).cpu().numpy()
+
+    denoised = overlap_add_row_major(pred_frames, hop_size=hop_size, signal_length=len(x))
     denoised = denoised[:original_len]
 
     peak = float(np.max(np.abs(denoised)))
@@ -185,16 +237,32 @@ def _safe_stem(path: Path) -> str:
     return stem or "sample"
 
 
-def print_case_metrics(case: int, signal_name: str, noise_name: str, snr_noisy: float, snr_denoised: float, pesq_noisy: float, pesq_denoised: float) -> None:
+def print_case_metrics(
+    case: int,
+    signal_name: str,
+    noise_name: str,
+    snr_noisy: float,
+    snr_denoised: float,
+    pesq_noisy: float,
+    pesq_denoised: float,
+    snr_resunet: float | None = None,
+    pesq_resunet: float | None = None,
+) -> None:
     print("\n" + "=" * 72)
     print(f"Case {case:02d}: signal={signal_name} | noise={noise_name}")
     print("-" * 72)
     print(f"SNR  noisy    : {snr_noisy:8.3f} dB")
-    print(f"SNR  denoised : {snr_denoised:8.3f} dB")
-    print(f"dSNR          : {snr_denoised - snr_noisy:+8.3f} dB")
+    print(f"SNR  pca      : {snr_denoised:8.3f} dB")
+    print(f"dSNR (pca)    : {snr_denoised - snr_noisy:+8.3f} dB")
+    if snr_resunet is not None:
+        print(f"SNR  resunet  : {snr_resunet:8.3f} dB")
+        print(f"dSNR (resunet): {snr_resunet - snr_noisy:+8.3f} dB")
     print(f"PESQ noisy    : {pesq_noisy:8.3f}")
-    print(f"PESQ denoised : {pesq_denoised:8.3f}")
-    print(f"dPESQ         : {pesq_denoised - pesq_noisy:+8.3f}")
+    print(f"PESQ pca      : {pesq_denoised:8.3f}")
+    print(f"dPESQ (pca)   : {pesq_denoised - pesq_noisy:+8.3f}")
+    if pesq_resunet is not None:
+        print(f"PESQ resunet  : {pesq_resunet:8.3f}")
+        print(f"dPESQ (resunet): {pesq_resunet - pesq_noisy:+8.3f}")
 
 
 def summarize_metrics(rows: list[dict[str, float | str]]) -> None:
@@ -206,6 +274,8 @@ def summarize_metrics(rows: list[dict[str, float | str]]) -> None:
         if len(valid) == 0:
             return float("nan"), float("nan")
         return float(np.mean(valid)), float(np.std(valid))
+
+    include_resunet = "snr_resunet" in rows[0]
 
     snr_noisy = np.array([float(r["snr_noisy"]) for r in rows], dtype=np.float64)
     snr_denoised = np.array([float(r["snr_denoised"]) for r in rows], dtype=np.float64)
@@ -221,11 +291,22 @@ def summarize_metrics(rows: list[dict[str, float | str]]) -> None:
     print("AGGREGATE METRICS")
     print("=" * 72)
     print(f"SNR  noisy    : {snr_n_mu:8.3f} +/- {snr_n_std:8.3f} dB")
-    print(f"SNR  denoised : {snr_d_mu:8.3f} +/- {snr_d_std:8.3f} dB")
-    print(f"dSNR          : {(snr_d_mu - snr_n_mu):8.3f} dB")
+    print(f"SNR  pca      : {snr_d_mu:8.3f} +/- {snr_d_std:8.3f} dB")
+    print(f"dSNR (pca)    : {(snr_d_mu - snr_n_mu):8.3f} dB")
     print(f"PESQ noisy    : {pesq_n_mu:8.3f} +/- {pesq_n_std:8.3f}")
-    print(f"PESQ denoised : {pesq_d_mu:8.3f} +/- {pesq_d_std:8.3f}")
-    print(f"dPESQ         : {(pesq_d_mu - pesq_n_mu):8.3f}")
+    print(f"PESQ pca      : {pesq_d_mu:8.3f} +/- {pesq_d_std:8.3f}")
+    print(f"dPESQ (pca)   : {(pesq_d_mu - pesq_n_mu):8.3f}")
+
+    if include_resunet:
+        snr_resunet = np.array([float(r["snr_resunet"]) for r in rows], dtype=np.float64)
+        pesq_resunet = np.array([float(r["pesq_resunet"]) for r in rows], dtype=np.float64)
+        snr_r_mu, snr_r_std = mean_std(snr_resunet)
+        pesq_r_mu, pesq_r_std = mean_std(pesq_resunet)
+        print(f"SNR  resunet  : {snr_r_mu:8.3f} +/- {snr_r_std:8.3f} dB")
+        print(f"dSNR (resunet): {(snr_r_mu - snr_n_mu):8.3f} dB")
+        print(f"PESQ resunet  : {pesq_r_mu:8.3f} +/- {pesq_r_std:8.3f}")
+        print(f"dPESQ (resunet): {(pesq_r_mu - pesq_n_mu):8.3f}")
+
     print("=" * 72)
 
 
@@ -253,6 +334,8 @@ def _finite_stats(values: np.ndarray) -> dict[str, float]:
 
 
 def save_aggregate_metrics(rows: list[dict[str, float | str]], save_path: Path) -> None:
+    include_resunet = "snr_resunet" in rows[0]
+
     snr_noisy = _to_float_array(rows, "snr_noisy")
     snr_denoised = _to_float_array(rows, "snr_denoised")
     delta_snr = _to_float_array(rows, "delta_snr")
@@ -303,6 +386,44 @@ def save_aggregate_metrics(rows: list[dict[str, float | str]], save_path: Path) 
         "pesq_improved_cases": int(np.sum(delta_pesq > 0.0)),
     }
 
+    if include_resunet:
+        snr_resunet = _to_float_array(rows, "snr_resunet")
+        pesq_resunet = _to_float_array(rows, "pesq_resunet")
+        delta_snr_resunet = _to_float_array(rows, "delta_snr_resunet")
+        delta_pesq_resunet = _to_float_array(rows, "delta_pesq_resunet")
+
+        snr_r_stats = _finite_stats(snr_resunet)
+        pesq_r_stats = _finite_stats(pesq_resunet)
+        dsnr_r_stats = _finite_stats(delta_snr_resunet)
+        dpesq_r_stats = _finite_stats(delta_pesq_resunet)
+
+        row.update(
+            {
+                "snr_resunet_mean": snr_r_stats["mean"],
+                "snr_resunet_std": snr_r_stats["std"],
+                "snr_resunet_median": snr_r_stats["median"],
+                "snr_resunet_min": snr_r_stats["min"],
+                "snr_resunet_max": snr_r_stats["max"],
+                "delta_snr_resunet_mean": dsnr_r_stats["mean"],
+                "delta_snr_resunet_std": dsnr_r_stats["std"],
+                "delta_snr_resunet_median": dsnr_r_stats["median"],
+                "delta_snr_resunet_min": dsnr_r_stats["min"],
+                "delta_snr_resunet_max": dsnr_r_stats["max"],
+                "snr_resunet_improved_cases": int(np.sum(delta_snr_resunet > 0.0)),
+                "pesq_resunet_mean": pesq_r_stats["mean"],
+                "pesq_resunet_std": pesq_r_stats["std"],
+                "pesq_resunet_median": pesq_r_stats["median"],
+                "pesq_resunet_min": pesq_r_stats["min"],
+                "pesq_resunet_max": pesq_r_stats["max"],
+                "delta_pesq_resunet_mean": dpesq_r_stats["mean"],
+                "delta_pesq_resunet_std": dpesq_r_stats["std"],
+                "delta_pesq_resunet_median": dpesq_r_stats["median"],
+                "delta_pesq_resunet_min": dpesq_r_stats["min"],
+                "delta_pesq_resunet_max": dpesq_r_stats["max"],
+                "pesq_resunet_improved_cases": int(np.sum(delta_pesq_resunet > 0.0)),
+            }
+        )
+
     with save_path.open("w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=list(row.keys()))
         writer.writeheader()
@@ -311,6 +432,7 @@ def save_aggregate_metrics(rows: list[dict[str, float | str]], save_path: Path) 
 
 def save_metric_plots(rows: list[dict[str, float | str]], plots_dir: Path) -> None:
     plots_dir.mkdir(parents=True, exist_ok=True)
+    include_resunet = "snr_resunet" in rows[0]
     case_idx = np.arange(1, len(rows) + 1)
 
     snr_noisy = _to_float_array(rows, "snr_noisy")
@@ -320,9 +442,17 @@ def save_metric_plots(rows: list[dict[str, float | str]], plots_dir: Path) -> No
     delta_snr = _to_float_array(rows, "delta_snr")
     delta_pesq = _to_float_array(rows, "delta_pesq")
 
+    if include_resunet:
+        snr_resunet = _to_float_array(rows, "snr_resunet")
+        pesq_resunet = _to_float_array(rows, "pesq_resunet")
+        delta_snr_resunet = _to_float_array(rows, "delta_snr_resunet")
+        delta_pesq_resunet = _to_float_array(rows, "delta_pesq_resunet")
+
     fig, ax = plt.subplots(figsize=(10, 4.8))
     ax.plot(case_idx, snr_noisy, "o-", label="Noisy", color="#D62728")
-    ax.plot(case_idx, snr_denoised, "o-", label="Denoised", color="#1F77B4")
+    ax.plot(case_idx, snr_denoised, "o-", label="PCA", color="#1F77B4")
+    if include_resunet:
+        ax.plot(case_idx, snr_resunet, "o-", label="ResUNet", color="#FF7F0E")
     ax.set_title("SNR Per Case")
     ax.set_xlabel("Case")
     ax.set_ylabel("SNR (dB)")
@@ -334,7 +464,9 @@ def save_metric_plots(rows: list[dict[str, float | str]], plots_dir: Path) -> No
 
     fig, ax = plt.subplots(figsize=(10, 4.8))
     ax.plot(case_idx, pesq_noisy, "o-", label="Noisy", color="#D62728")
-    ax.plot(case_idx, pesq_denoised, "o-", label="Denoised", color="#1F77B4")
+    ax.plot(case_idx, pesq_denoised, "o-", label="PCA", color="#1F77B4")
+    if include_resunet:
+        ax.plot(case_idx, pesq_resunet, "o-", label="ResUNet", color="#FF7F0E")
     ax.set_title("PESQ Per Case")
     ax.set_xlabel("Case")
     ax.set_ylabel("PESQ")
@@ -348,15 +480,27 @@ def save_metric_plots(rows: list[dict[str, float | str]], plots_dir: Path) -> No
     snr_colors = np.where(delta_snr >= 0.0, "#2CA02C", "#D62728")
     pesq_colors = np.where(delta_pesq >= 0.0, "#2CA02C", "#D62728")
 
-    axes[0].bar(case_idx, delta_snr, color=snr_colors)
+    if include_resunet:
+        width = 0.38
+        axes[0].bar(case_idx - width / 2, delta_snr, width=width, color="#1F77B4", label="PCA")
+        axes[0].bar(case_idx + width / 2, delta_snr_resunet, width=width, color="#FF7F0E", label="ResUNet")
+        axes[0].legend()
+    else:
+        axes[0].bar(case_idx, delta_snr, color=snr_colors)
     axes[0].axhline(0.0, color="black", linewidth=1.0)
-    axes[0].set_title("Delta SNR Per Case (Denoised - Noisy)")
+    axes[0].set_title("Delta SNR Per Case (Model - Noisy)")
     axes[0].set_ylabel("dSNR (dB)")
     axes[0].grid(alpha=0.3, axis="y")
 
-    axes[1].bar(case_idx, delta_pesq, color=pesq_colors)
+    if include_resunet:
+        width = 0.38
+        axes[1].bar(case_idx - width / 2, delta_pesq, width=width, color="#1F77B4", label="PCA")
+        axes[1].bar(case_idx + width / 2, delta_pesq_resunet, width=width, color="#FF7F0E", label="ResUNet")
+        axes[1].legend()
+    else:
+        axes[1].bar(case_idx, delta_pesq, color=pesq_colors)
     axes[1].axhline(0.0, color="black", linewidth=1.0)
-    axes[1].set_title("Delta PESQ Per Case (Denoised - Noisy)")
+    axes[1].set_title("Delta PESQ Per Case (Model - Noisy)")
     axes[1].set_xlabel("Case")
     axes[1].set_ylabel("dPESQ")
     axes[1].grid(alpha=0.3, axis="y")
@@ -391,9 +535,22 @@ def main() -> None:
     if not args.skip_video:
         ffmpeg_bin = resolve_ffmpeg_binary()
 
+    resunet_model = None
+    resunet_device = None
+    if args.compare_resunet:
+        if not args.resunet_weights_path.exists():
+            raise FileNotFoundError(f"ResUNet checkpoint not found: {args.resunet_weights_path}")
+        if args.resunet_frame_size <= 0:
+            raise ValueError("resunet-frame-size must be positive")
+        if args.resunet_hop_size <= 0 or args.resunet_hop_size > args.resunet_frame_size:
+            raise ValueError(f"resunet-hop-size must be in [1, {args.resunet_frame_size}]")
+        resunet_model, resunet_device = load_resunet_model(args.resunet_weights_path)
+
     print(f"Using weights: {args.weights_path}")
     print(f"Input signal/noise pairs: {len(pairs)}")
     print(f"Target SNR for mixing: {args.mix_snr_db} dB")
+    if args.compare_resunet:
+        print(f"Comparing with ResUNet checkpoint: {args.resunet_weights_path}")
 
     metrics_rows: list[dict[str, float | str]] = []
 
@@ -403,15 +560,37 @@ def main() -> None:
         noisy, alpha = mix_at_snr(clean, noise, args.mix_snr_db)
         denoised = pca_denoise_signal(noisy, v_s=v_s, mean=mean, hop_size=args.hop_size)
 
-        n = min(len(clean), len(noisy), len(denoised))
+        denoised_resunet = None
+        if resunet_model is not None and resunet_device is not None:
+            denoised_resunet = resunet_denoise_signal(
+                noisy,
+                model=resunet_model,
+                device=resunet_device,
+                frame_size=args.resunet_frame_size,
+                hop_size=args.resunet_hop_size,
+            )
+
+        if denoised_resunet is None:
+            n = min(len(clean), len(noisy), len(denoised))
+        else:
+            n = min(len(clean), len(noisy), len(denoised), len(denoised_resunet))
+
         clean = clean[:n]
         noisy = noisy[:n]
         denoised = denoised[:n]
+        if denoised_resunet is not None:
+            denoised_resunet = denoised_resunet[:n]
 
         snr_noisy = compute_snr(clean, noisy)
         snr_denoised = compute_snr(clean, denoised)
         pesq_noisy = compute_pesq(clean, noisy, args.target_sr)
         pesq_denoised = compute_pesq(clean, denoised, args.target_sr)
+
+        snr_resunet = None
+        pesq_resunet = None
+        if denoised_resunet is not None:
+            snr_resunet = compute_snr(clean, denoised_resunet)
+            pesq_resunet = compute_pesq(clean, denoised_resunet, args.target_sr)
 
         print_case_metrics(
             case=idx,
@@ -421,17 +600,22 @@ def main() -> None:
             snr_denoised=snr_denoised,
             pesq_noisy=pesq_noisy,
             pesq_denoised=pesq_denoised,
+            snr_resunet=snr_resunet,
+            pesq_resunet=pesq_resunet,
         )
 
         stem = f"case_{idx:02d}_{_safe_stem(signal_path)}"
         clean_wav = args.output_dir / f"{stem}_signal.wav"
         noisy_wav = args.output_dir / f"{stem}_noisy.wav"
         denoised_wav = args.output_dir / f"{stem}_denoised.wav"
+        denoised_resunet_wav = args.output_dir / f"{stem}_resunet_denoised.wav"
         denoised_video = args.output_dir / f"{stem}_denoised.mp4"
 
         sf.write(clean_wav, clean, args.target_sr)
         sf.write(noisy_wav, noisy, args.target_sr)
         sf.write(denoised_wav, denoised, args.target_sr)
+        if denoised_resunet is not None:
+            sf.write(denoised_resunet_wav, denoised_resunet, args.target_sr)
 
         if ffmpeg_bin is not None:
             with tempfile.TemporaryDirectory() as tmp:
@@ -444,22 +628,29 @@ def main() -> None:
                 )
                 make_video_from_audio(ffmpeg_bin, cover, denoised_wav, denoised_video)
 
-        metrics_rows.append(
-            {
-                "case": idx,
-                "signal_file": signal_path.name,
-                "noise_file": noise_path.name,
-                "alpha": alpha,
-                "snr_noisy": snr_noisy,
-                "snr_denoised": snr_denoised,
-                "delta_snr": snr_denoised - snr_noisy,
-                "pesq_noisy": pesq_noisy,
-                "pesq_denoised": pesq_denoised,
-                "delta_pesq": pesq_denoised - pesq_noisy,
-            }
-        )
+        row: dict[str, float | str] = {
+            "case": idx,
+            "signal_file": signal_path.name,
+            "noise_file": noise_path.name,
+            "alpha": alpha,
+            "snr_noisy": snr_noisy,
+            "snr_denoised": snr_denoised,
+            "delta_snr": snr_denoised - snr_noisy,
+            "pesq_noisy": pesq_noisy,
+            "pesq_denoised": pesq_denoised,
+            "delta_pesq": pesq_denoised - pesq_noisy,
+        }
+        if snr_resunet is not None and pesq_resunet is not None:
+            row["snr_resunet"] = snr_resunet
+            row["delta_snr_resunet"] = snr_resunet - snr_noisy
+            row["pesq_resunet"] = pesq_resunet
+            row["delta_pesq_resunet"] = pesq_resunet - pesq_noisy
+        metrics_rows.append(row)
 
-        print(f"Saved: {clean_wav.name}, {noisy_wav.name}, {denoised_wav.name}")
+        if denoised_resunet is not None:
+            print(f"Saved: {clean_wav.name}, {noisy_wav.name}, {denoised_wav.name}, {denoised_resunet_wav.name}")
+        else:
+            print(f"Saved: {clean_wav.name}, {noisy_wav.name}, {denoised_wav.name}")
 
     metrics_path = args.output_dir / "metrics_summary.csv"
     with metrics_path.open("w", newline="") as f:
@@ -475,6 +666,13 @@ def main() -> None:
             "pesq_denoised",
             "delta_pesq",
         ]
+        if args.compare_resunet:
+            fieldnames += [
+                "snr_resunet",
+                "delta_snr_resunet",
+                "pesq_resunet",
+                "delta_pesq_resunet",
+            ]
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(metrics_rows)
