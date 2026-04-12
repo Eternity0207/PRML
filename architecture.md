@@ -2,6 +2,50 @@
 
 This file contains the technical structure of the project, including model layers, pipeline flow, and module responsibilities.
 
+## 0. Documentation Mirror (README Preservation)
+
+To preserve key operational README content in a second file, this section mirrors setup requirements and execution steps.
+
+### Package Requirements (mirrored)
+
+- kagglehub>=0.3.7
+- librosa>=0.10.2
+- soundfile>=0.12.1
+- pesq>=0.0.4
+- matplotlib>=3.8.0
+- numpy>=1.26.0
+- torch>=2.2.0
+- ffmpeg
+- imageio-ffmpeg
+
+System note:
+
+- A working `ffmpeg` executable is needed for video creation in `scripts/denoise_with_pca_weights.py`.
+- On macOS, use `brew install ffmpeg` if the executable is not found.
+
+### Run Instructions (mirrored)
+
+1. Setup environment
+- `chmod +x setup.sh`
+- `./setup.sh`
+- `source .venv/bin/activate`
+- `pip install -r requirements.txt`
+
+2. Run PCA pipeline
+- `python scripts/run_pca.py --num-samples 5 --mix-snr-db 0 --output-dir outputs/pca`
+
+3. Run ResUNet pipeline
+- `python scripts/run_resunet.py --num-samples 10 --epochs 8 --output-dir outputs/resunet`
+
+4. Run PCA-weight inference script
+- `python scripts/denoise_with_pca_weights.py`
+
+5. Run testing command (signal/noise subfolders, no video)
+- `python scripts/denoise_with_pca_weights.py --input-dir input --signal-subdir signal --noise-subdir noise --mix-snr-db 0 --output-dir output --skip-video`
+
+6. Generate slides (optional)
+- `python ppt_generator/generate_pca_presentation.py`
+
 ## 1. Project Layering
 
 The project is organized in five logical layers:

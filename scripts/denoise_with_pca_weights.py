@@ -1,23 +1,65 @@
 from __future__ import annotations
 
+import argparse
+import csv
+import random
+import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
 import soundfile as sf
 
-from prml_denoise.data_io import load_audio
-from prml_denoise.dsp import frame_signal, overlap_add_column_major
+from prml_denoise.data_io import AUDIO_EXTENSIONS, list_audio_files, load_audio
+from prml_denoise.dsp import compute_pesq, compute_snr, frame_signal, mix_at_snr, overlap_add_column_major
 
 
-INPUT_DIR = Path("input")
-OUTPUT_DIR = Path("output")
-WEIGHTS_PATH = Path("pca_weights.npz")
-TARGET_SR = 16_000
-HOP_SIZE = 256
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Create noisy mixtures from signal+noise pairs, denoise with PCA weights, and compare metrics."
+    )
+    parser.add_argument("--input-dir", type=Path, default=Path("input"))
+    parser.add_argument("--signal-subdir", type=str, default="signal")
+    parser.add_argument("--noise-subdir", type=str, default="noise")
+    parser.add_argument("--output-dir", type=Path, default=Path("output"))
+    parser.add_argument("--weights-path", type=Path, default=Path("pca_weights.npz"))
+    parser.add_argument("--target-sr", type=int, default=16_000)
+    parser.add_argument("--hop-size", type=int, default=256)
+    parser.add_argument("--mix-snr-db", type=float, default=0.0)
+    parser.add_argument("--num-samples", type=int, default=0, help="0 means use all available pairs")
+    parser.add_argument("--random-seed", type=int, default=42)
+    parser.add_argument("--skip-video", action="store_true", help="Skip MP4 generation")
+    return parser.parse_args()
+
+
+def resolve_ffmpeg_binary() -> str:
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if ffmpeg_bin is not None:
+        return ffmpeg_bin
+
+    try:
+        import imageio_ffmpeg
+    except ImportError as exc:
+        raise RuntimeError(
+            "ffmpeg executable not found in PATH.\n"
+            "Note: 'pip install ffmpeg' does not install the ffmpeg command-line binary.\n"
+            "Fix one of the following and run again:\n"
+            "  1) brew install ffmpeg\n"
+            "  2) pip install imageio-ffmpeg"
+        ) from exc
+
+    ffmpeg_bin = imageio_ffmpeg.get_ffmpeg_exe()
+    if not ffmpeg_bin or not Path(ffmpeg_bin).exists():
+        raise RuntimeError(
+            "Unable to resolve ffmpeg binary. Install ffmpeg with:\n"
+            "  brew install ffmpeg"
+        )
+    return ffmpeg_bin
 
 
 def load_pca_weights(weights_path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -84,13 +126,7 @@ def create_waveform_image(cleaned: np.ndarray, sr: int, image_path: Path, title:
     plt.close(fig)
 
 
-def make_video_from_audio(image_path: Path, audio_path: Path, video_path: Path) -> None:
-    ffmpeg_bin = shutil.which("ffmpeg")
-    if ffmpeg_bin is None:
-        raise RuntimeError(
-            "ffmpeg is required to create video output. Install ffmpeg and run again."
-        )
-
+def make_video_from_audio(ffmpeg_bin: str, image_path: Path, audio_path: Path, video_path: Path) -> None:
     cmd = [
         ffmpeg_bin,
         "-y",
@@ -116,50 +152,342 @@ def make_video_from_audio(image_path: Path, audio_path: Path, video_path: Path) 
     subprocess.run(cmd, check=True)
 
 
+def collect_signal_noise_pairs(input_dir: Path, signal_subdir: str, noise_subdir: str) -> list[tuple[Path, Path]]:
+    signal_dir = input_dir / signal_subdir
+    noise_dir = input_dir / noise_subdir
+
+    if not signal_dir.is_dir():
+        raise FileNotFoundError(f"Signal directory not found: {signal_dir}")
+    if not noise_dir.is_dir():
+        raise FileNotFoundError(f"Noise directory not found: {noise_dir}")
+
+    signal_files = list_audio_files(signal_dir, AUDIO_EXTENSIONS)
+    noise_files = list_audio_files(noise_dir, AUDIO_EXTENSIONS)
+
+    if len(signal_files) != len(noise_files):
+        raise ValueError(
+            f"Signal/noise file count mismatch: {len(signal_files)} signal files vs {len(noise_files)} noise files"
+        )
+
+    return list(zip(signal_files, noise_files))
+
+
+def select_pairs(pairs: list[tuple[Path, Path]], num_samples: int, random_seed: int) -> list[tuple[Path, Path]]:
+    if num_samples <= 0 or num_samples >= len(pairs):
+        return pairs
+    rng = random.Random(random_seed)
+    return rng.sample(pairs, num_samples)
+
+
+def _safe_stem(path: Path) -> str:
+    stem = re.sub(r"\s+", "_", path.stem.strip())
+    stem = re.sub(r"[^A-Za-z0-9._-]", "", stem)
+    return stem or "sample"
+
+
+def print_case_metrics(case: int, signal_name: str, noise_name: str, snr_noisy: float, snr_denoised: float, pesq_noisy: float, pesq_denoised: float) -> None:
+    print("\n" + "=" * 72)
+    print(f"Case {case:02d}: signal={signal_name} | noise={noise_name}")
+    print("-" * 72)
+    print(f"SNR  noisy    : {snr_noisy:8.3f} dB")
+    print(f"SNR  denoised : {snr_denoised:8.3f} dB")
+    print(f"dSNR          : {snr_denoised - snr_noisy:+8.3f} dB")
+    print(f"PESQ noisy    : {pesq_noisy:8.3f}")
+    print(f"PESQ denoised : {pesq_denoised:8.3f}")
+    print(f"dPESQ         : {pesq_denoised - pesq_noisy:+8.3f}")
+
+
+def summarize_metrics(rows: list[dict[str, float | str]]) -> None:
+    if not rows:
+        return
+
+    def mean_std(values: np.ndarray) -> tuple[float, float]:
+        valid = values[~np.isnan(values)]
+        if len(valid) == 0:
+            return float("nan"), float("nan")
+        return float(np.mean(valid)), float(np.std(valid))
+
+    snr_noisy = np.array([float(r["snr_noisy"]) for r in rows], dtype=np.float64)
+    snr_denoised = np.array([float(r["snr_denoised"]) for r in rows], dtype=np.float64)
+    pesq_noisy = np.array([float(r["pesq_noisy"]) for r in rows], dtype=np.float64)
+    pesq_denoised = np.array([float(r["pesq_denoised"]) for r in rows], dtype=np.float64)
+
+    snr_n_mu, snr_n_std = mean_std(snr_noisy)
+    snr_d_mu, snr_d_std = mean_std(snr_denoised)
+    pesq_n_mu, pesq_n_std = mean_std(pesq_noisy)
+    pesq_d_mu, pesq_d_std = mean_std(pesq_denoised)
+
+    print("\n" + "=" * 72)
+    print("AGGREGATE METRICS")
+    print("=" * 72)
+    print(f"SNR  noisy    : {snr_n_mu:8.3f} +/- {snr_n_std:8.3f} dB")
+    print(f"SNR  denoised : {snr_d_mu:8.3f} +/- {snr_d_std:8.3f} dB")
+    print(f"dSNR          : {(snr_d_mu - snr_n_mu):8.3f} dB")
+    print(f"PESQ noisy    : {pesq_n_mu:8.3f} +/- {pesq_n_std:8.3f}")
+    print(f"PESQ denoised : {pesq_d_mu:8.3f} +/- {pesq_d_std:8.3f}")
+    print(f"dPESQ         : {(pesq_d_mu - pesq_n_mu):8.3f}")
+    print("=" * 72)
+
+
+def _to_float_array(rows: list[dict[str, float | str]], key: str) -> np.ndarray:
+    return np.array([float(r[key]) for r in rows], dtype=np.float64)
+
+
+def _finite_stats(values: np.ndarray) -> dict[str, float]:
+    finite = values[np.isfinite(values)]
+    if len(finite) == 0:
+        return {
+            "mean": float("nan"),
+            "std": float("nan"),
+            "median": float("nan"),
+            "min": float("nan"),
+            "max": float("nan"),
+        }
+    return {
+        "mean": float(np.mean(finite)),
+        "std": float(np.std(finite)),
+        "median": float(np.median(finite)),
+        "min": float(np.min(finite)),
+        "max": float(np.max(finite)),
+    }
+
+
+def save_aggregate_metrics(rows: list[dict[str, float | str]], save_path: Path) -> None:
+    snr_noisy = _to_float_array(rows, "snr_noisy")
+    snr_denoised = _to_float_array(rows, "snr_denoised")
+    delta_snr = _to_float_array(rows, "delta_snr")
+    pesq_noisy = _to_float_array(rows, "pesq_noisy")
+    pesq_denoised = _to_float_array(rows, "pesq_denoised")
+    delta_pesq = _to_float_array(rows, "delta_pesq")
+
+    snr_n_stats = _finite_stats(snr_noisy)
+    snr_d_stats = _finite_stats(snr_denoised)
+    dsnr_stats = _finite_stats(delta_snr)
+    pesq_n_stats = _finite_stats(pesq_noisy)
+    pesq_d_stats = _finite_stats(pesq_denoised)
+    dpesq_stats = _finite_stats(delta_pesq)
+
+    row = {
+        "num_cases": len(rows),
+        "snr_noisy_mean": snr_n_stats["mean"],
+        "snr_noisy_std": snr_n_stats["std"],
+        "snr_noisy_median": snr_n_stats["median"],
+        "snr_noisy_min": snr_n_stats["min"],
+        "snr_noisy_max": snr_n_stats["max"],
+        "snr_denoised_mean": snr_d_stats["mean"],
+        "snr_denoised_std": snr_d_stats["std"],
+        "snr_denoised_median": snr_d_stats["median"],
+        "snr_denoised_min": snr_d_stats["min"],
+        "snr_denoised_max": snr_d_stats["max"],
+        "delta_snr_mean": dsnr_stats["mean"],
+        "delta_snr_std": dsnr_stats["std"],
+        "delta_snr_median": dsnr_stats["median"],
+        "delta_snr_min": dsnr_stats["min"],
+        "delta_snr_max": dsnr_stats["max"],
+        "snr_improved_cases": int(np.sum(delta_snr > 0.0)),
+        "pesq_noisy_mean": pesq_n_stats["mean"],
+        "pesq_noisy_std": pesq_n_stats["std"],
+        "pesq_noisy_median": pesq_n_stats["median"],
+        "pesq_noisy_min": pesq_n_stats["min"],
+        "pesq_noisy_max": pesq_n_stats["max"],
+        "pesq_denoised_mean": pesq_d_stats["mean"],
+        "pesq_denoised_std": pesq_d_stats["std"],
+        "pesq_denoised_median": pesq_d_stats["median"],
+        "pesq_denoised_min": pesq_d_stats["min"],
+        "pesq_denoised_max": pesq_d_stats["max"],
+        "delta_pesq_mean": dpesq_stats["mean"],
+        "delta_pesq_std": dpesq_stats["std"],
+        "delta_pesq_median": dpesq_stats["median"],
+        "delta_pesq_min": dpesq_stats["min"],
+        "delta_pesq_max": dpesq_stats["max"],
+        "pesq_improved_cases": int(np.sum(delta_pesq > 0.0)),
+    }
+
+    with save_path.open("w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
+        writer.writeheader()
+        writer.writerow(row)
+
+
+def save_metric_plots(rows: list[dict[str, float | str]], plots_dir: Path) -> None:
+    plots_dir.mkdir(parents=True, exist_ok=True)
+    case_idx = np.arange(1, len(rows) + 1)
+
+    snr_noisy = _to_float_array(rows, "snr_noisy")
+    snr_denoised = _to_float_array(rows, "snr_denoised")
+    pesq_noisy = _to_float_array(rows, "pesq_noisy")
+    pesq_denoised = _to_float_array(rows, "pesq_denoised")
+    delta_snr = _to_float_array(rows, "delta_snr")
+    delta_pesq = _to_float_array(rows, "delta_pesq")
+
+    fig, ax = plt.subplots(figsize=(10, 4.8))
+    ax.plot(case_idx, snr_noisy, "o-", label="Noisy", color="#D62728")
+    ax.plot(case_idx, snr_denoised, "o-", label="Denoised", color="#1F77B4")
+    ax.set_title("SNR Per Case")
+    ax.set_xlabel("Case")
+    ax.set_ylabel("SNR (dB)")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(plots_dir / "snr_per_case.png", dpi=160)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(10, 4.8))
+    ax.plot(case_idx, pesq_noisy, "o-", label="Noisy", color="#D62728")
+    ax.plot(case_idx, pesq_denoised, "o-", label="Denoised", color="#1F77B4")
+    ax.set_title("PESQ Per Case")
+    ax.set_xlabel("Case")
+    ax.set_ylabel("PESQ")
+    ax.grid(alpha=0.3)
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(plots_dir / "pesq_per_case.png", dpi=160)
+    plt.close(fig)
+
+    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    snr_colors = np.where(delta_snr >= 0.0, "#2CA02C", "#D62728")
+    pesq_colors = np.where(delta_pesq >= 0.0, "#2CA02C", "#D62728")
+
+    axes[0].bar(case_idx, delta_snr, color=snr_colors)
+    axes[0].axhline(0.0, color="black", linewidth=1.0)
+    axes[0].set_title("Delta SNR Per Case (Denoised - Noisy)")
+    axes[0].set_ylabel("dSNR (dB)")
+    axes[0].grid(alpha=0.3, axis="y")
+
+    axes[1].bar(case_idx, delta_pesq, color=pesq_colors)
+    axes[1].axhline(0.0, color="black", linewidth=1.0)
+    axes[1].set_title("Delta PESQ Per Case (Denoised - Noisy)")
+    axes[1].set_xlabel("Case")
+    axes[1].set_ylabel("dPESQ")
+    axes[1].grid(alpha=0.3, axis="y")
+
+    plt.tight_layout()
+    plt.savefig(plots_dir / "metric_deltas_per_case.png", dpi=160)
+    plt.close(fig)
+
+
 def main() -> None:
-    if not WEIGHTS_PATH.exists():
-        raise FileNotFoundError(f"Weights file not found: {WEIGHTS_PATH}")
-    if not INPUT_DIR.exists():
-        raise FileNotFoundError(f"Input directory not found: {INPUT_DIR}")
+    args = parse_args()
 
-    audio_files = sorted(INPUT_DIR.glob("*.wav"))
-    if not audio_files:
-        raise FileNotFoundError("No .wav files found in input/")
+    if not args.weights_path.exists():
+        raise FileNotFoundError(f"Weights file not found: {args.weights_path}")
+    if not args.input_dir.exists():
+        raise FileNotFoundError(f"Input directory not found: {args.input_dir}")
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    all_pairs = collect_signal_noise_pairs(args.input_dir, args.signal_subdir, args.noise_subdir)
+    pairs = select_pairs(all_pairs, args.num_samples, args.random_seed)
+    if not pairs:
+        raise RuntimeError("No signal/noise pairs found in the input folders.")
 
-    v_s, mean = load_pca_weights(WEIGHTS_PATH)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    v_s, mean = load_pca_weights(args.weights_path)
     frame_size = v_s.shape[0]
 
-    if HOP_SIZE <= 0 or HOP_SIZE > frame_size:
-        raise ValueError(f"HOP_SIZE must be in [1, {frame_size}]")
+    if args.hop_size <= 0 or args.hop_size > frame_size:
+        raise ValueError(f"hop-size must be in [1, {frame_size}]")
 
-    print(f"Found {len(audio_files)} input files in {INPUT_DIR}")
-    print(f"Using weights: {WEIGHTS_PATH}")
+    ffmpeg_bin = None
+    if not args.skip_video:
+        ffmpeg_bin = resolve_ffmpeg_binary()
 
-    for input_audio in audio_files:
-        noisy = load_audio(input_audio, target_sr=TARGET_SR)
-        denoised = pca_denoise_signal(noisy, v_s=v_s, mean=mean, hop_size=HOP_SIZE)
+    print(f"Using weights: {args.weights_path}")
+    print(f"Input signal/noise pairs: {len(pairs)}")
+    print(f"Target SNR for mixing: {args.mix_snr_db} dB")
 
-        stem = input_audio.stem
-        denoised_wav = OUTPUT_DIR / f"{stem}_denoised.wav"
-        denoised_video = OUTPUT_DIR / f"{stem}_denoised.mp4"
+    metrics_rows: list[dict[str, float | str]] = []
 
-        sf.write(denoised_wav, denoised, TARGET_SR)
+    for idx, (signal_path, noise_path) in enumerate(pairs, start=1):
+        clean = load_audio(signal_path, target_sr=args.target_sr)
+        noise = load_audio(noise_path, target_sr=args.target_sr)
+        noisy, alpha = mix_at_snr(clean, noise, args.mix_snr_db)
+        denoised = pca_denoise_signal(noisy, v_s=v_s, mean=mean, hop_size=args.hop_size)
 
-        with tempfile.TemporaryDirectory() as tmp:
-            cover = Path(tmp) / "waveform.png"
-            create_waveform_image(
-                cleaned=denoised,
-                sr=TARGET_SR,
-                image_path=cover,
-                title=f"Denoised Output (PCA) - {stem}",
-            )
-            make_video_from_audio(cover, denoised_wav, denoised_video)
+        n = min(len(clean), len(noisy), len(denoised))
+        clean = clean[:n]
+        noisy = noisy[:n]
+        denoised = denoised[:n]
 
-        print(f"Done: {input_audio.name}")
-        print(f"  Audio -> {denoised_wav}")
-        print(f"  Video -> {denoised_video}")
+        snr_noisy = compute_snr(clean, noisy)
+        snr_denoised = compute_snr(clean, denoised)
+        pesq_noisy = compute_pesq(clean, noisy, args.target_sr)
+        pesq_denoised = compute_pesq(clean, denoised, args.target_sr)
+
+        print_case_metrics(
+            case=idx,
+            signal_name=signal_path.name,
+            noise_name=noise_path.name,
+            snr_noisy=snr_noisy,
+            snr_denoised=snr_denoised,
+            pesq_noisy=pesq_noisy,
+            pesq_denoised=pesq_denoised,
+        )
+
+        stem = f"case_{idx:02d}_{_safe_stem(signal_path)}"
+        clean_wav = args.output_dir / f"{stem}_signal.wav"
+        noisy_wav = args.output_dir / f"{stem}_noisy.wav"
+        denoised_wav = args.output_dir / f"{stem}_denoised.wav"
+        denoised_video = args.output_dir / f"{stem}_denoised.mp4"
+
+        sf.write(clean_wav, clean, args.target_sr)
+        sf.write(noisy_wav, noisy, args.target_sr)
+        sf.write(denoised_wav, denoised, args.target_sr)
+
+        if ffmpeg_bin is not None:
+            with tempfile.TemporaryDirectory() as tmp:
+                cover = Path(tmp) / "waveform.png"
+                create_waveform_image(
+                    cleaned=denoised,
+                    sr=args.target_sr,
+                    image_path=cover,
+                    title=f"Denoised Output (PCA) - {stem}",
+                )
+                make_video_from_audio(ffmpeg_bin, cover, denoised_wav, denoised_video)
+
+        metrics_rows.append(
+            {
+                "case": idx,
+                "signal_file": signal_path.name,
+                "noise_file": noise_path.name,
+                "alpha": alpha,
+                "snr_noisy": snr_noisy,
+                "snr_denoised": snr_denoised,
+                "delta_snr": snr_denoised - snr_noisy,
+                "pesq_noisy": pesq_noisy,
+                "pesq_denoised": pesq_denoised,
+                "delta_pesq": pesq_denoised - pesq_noisy,
+            }
+        )
+
+        print(f"Saved: {clean_wav.name}, {noisy_wav.name}, {denoised_wav.name}")
+
+    metrics_path = args.output_dir / "metrics_summary.csv"
+    with metrics_path.open("w", newline="") as f:
+        fieldnames = [
+            "case",
+            "signal_file",
+            "noise_file",
+            "alpha",
+            "snr_noisy",
+            "snr_denoised",
+            "delta_snr",
+            "pesq_noisy",
+            "pesq_denoised",
+            "delta_pesq",
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(metrics_rows)
+
+    aggregate_metrics_path = args.output_dir / "metrics_aggregate.csv"
+    save_aggregate_metrics(metrics_rows, aggregate_metrics_path)
+    plots_dir = args.output_dir / "plots"
+    save_metric_plots(metrics_rows, plots_dir)
+
+    summarize_metrics(metrics_rows)
+    print(f"\nMetrics CSV: {metrics_path}")
+    print(f"Aggregate metrics CSV: {aggregate_metrics_path}")
+    print(f"Metric plots: {plots_dir}")
 
 
 if __name__ == "__main__":

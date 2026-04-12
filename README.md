@@ -5,6 +5,78 @@
 This project studies speech denoising with PCA as the primary method and ResUNet as a comparison method.
 The objective is to recover clean and intelligible speech from noisy recordings while preserving natural voice characteristics.
 
+## Package Requirements
+
+Install dependencies from `requirements.txt`:
+
+```bash
+pip install -r requirements.txt
+```
+
+Current required packages:
+
+- kagglehub>=0.3.7
+- librosa>=0.10.2
+- soundfile>=0.12.1
+- pesq>=0.0.4
+- matplotlib>=3.8.0
+- numpy>=1.26.0
+- torch>=2.2.0
+- ffmpeg
+- imageio-ffmpeg
+
+Notes:
+
+- For video rendering in `scripts/denoise_with_pca_weights.py`, a working `ffmpeg` executable is required.
+- On macOS, install system ffmpeg with `brew install ffmpeg` if needed.
+
+## Setup and Run Instructions
+
+### 1. Environment setup
+
+```bash
+chmod +x setup.sh
+./setup.sh
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 2. Run PCA pipeline
+
+```bash
+python scripts/run_pca.py --num-samples 5 --mix-snr-db 0 --output-dir outputs/pca
+```
+
+### 3. Run ResUNet baseline
+
+```bash
+python scripts/run_resunet.py --num-samples 10 --epochs 8 --output-dir outputs/resunet
+```
+
+### 4. Denoise with saved PCA weights (inference)
+
+```bash
+python scripts/denoise_with_pca_weights.py
+```
+
+### 5. Test command (signal/noise subfolders, no video)
+
+```bash
+python scripts/denoise_with_pca_weights.py \
+	--input-dir input \
+	--signal-subdir signal \
+	--noise-subdir noise \
+	--mix-snr-db 0 \
+	--output-dir output \
+	--skip-video
+```
+
+### 6. Generate project presentation (optional)
+
+```bash
+python ppt_generator/generate_pca_presentation.py
+```
+
 ## 1. Problem Statement
 
 Real-world speech is often corrupted by environmental noise.
